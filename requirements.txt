@@ -1,0 +1,12 @@
+pandas
+numpy
+scikit-learn
+xgboost
+prophet
+tensorflow
+flet
+psycopg2-binary
+requests
+python-dotenv
+matplotlib
+seaborn
