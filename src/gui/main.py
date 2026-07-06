@@ -25,9 +25,11 @@ def main(page: ft.Page):
 
     sys.path.append(str(BASE_DIR / "src" / "api"))
     sys.path.append(str(BASE_DIR / "src" / "disaster"))
+    sys.path.append(str(BASE_DIR / "src" / "chatbot"))
     from weather_client import get_current_weather
     from season_timing import get_seasonal_pattern
     from risk_rules import assess_disaster_risk
+    from intent_parser import detect_intent, extract_country
 
     selected_country = {"name": "Nepal"}
 
@@ -100,6 +102,48 @@ def main(page: ft.Page):
         is_high_risk = probability > heatwave_threshold
 
         return {"probability": float(probability), "high_risk": bool(is_high_risk)}
+
+    def generate_chat_response(message):
+        intent = detect_intent(message)
+
+        # Try to detect a country name in the message; fall back to the Dashboard selection if none found
+        detected_country = extract_country(message, country_list)
+        country_name = detected_country if detected_country else selected_country["name"]
+
+        if intent == "weather":
+            lat, lon = country_coordinates[country_name]
+            try:
+                weather = get_current_weather(lat, lon)
+                return f"The current weather in {country_name} is {weather['temperature']}°C with {weather['condition'].lower()}."
+            except Exception:
+                return "Sorry, I couldn't fetch live weather data right now."
+
+        elif intent == "prediction":
+            result = predict_temperature_trend(country_name)
+            if result is None:
+                return f"Sorry, I don't have prediction data for {country_name}."
+            year_2050 = result["values"][-1]
+            return f"By 2050, {country_name}'s temperature is predicted to change by approximately {year_2050:.2f}°C."
+
+        elif intent == "season":
+            lat, lon = country_coordinates[country_name]
+            try:
+                seasonal_info = get_seasonal_pattern(lat, lon)
+                return f"In {country_name}, the warmest point of the year is typically around {seasonal_info['warmest_point']}, and the coldest around {seasonal_info['coldest_point']}."
+            except Exception:
+                return "Sorry, I couldn't calculate seasonal timing right now."
+
+        elif intent == "risk":
+            heatwave_result = predict_heatwave_risk(country_name)
+            if heatwave_result is None:
+                return f"Sorry, I don't have risk data for {country_name}."
+            if heatwave_result["high_risk"]:
+                return f"{country_name} currently shows elevated heatwave risk based on recent climate trends."
+            else:
+                return f"{country_name} currently shows normal heatwave risk conditions."
+
+        else:
+            return f"I'm not sure how to help with that. Try asking me about the weather, temperature predictions, seasons, or heatwave risk — mention a country name, or I'll use {country_name} by default."
 
     def build_dashboard():
         def country_changed(e):
@@ -361,6 +405,62 @@ def main(page: ft.Page):
             scroll=ft.ScrollMode.AUTO,
         )
 
+    def build_chatbot():
+        chat_messages = ft.Column(scroll=ft.ScrollMode.AUTO, expand=True, spacing=10)
+
+        chat_messages.controls.append(
+            ft.Container(
+                content=ft.Text(f"Hi! Ask me about the weather, predictions, seasons, or risk for any country. I'll use {selected_country['name']} by default if you don't mention one.", size=14),
+                bgcolor=ft.colors.INDIGO_50,
+                border_radius=10,
+                padding=12,
+            )
+        )
+
+        message_input = ft.TextField(hint_text="Type your question...", expand=True)
+
+        def send_clicked(e):
+            user_text = message_input.value
+            if not user_text:
+                return
+
+            chat_messages.controls.append(
+                ft.Container(
+                    content=ft.Text(user_text, size=14, color=ft.colors.WHITE),
+                    bgcolor=ft.colors.INDIGO_400,
+                    border_radius=10,
+                    padding=12,
+                    alignment=ft.alignment.center_right,
+                )
+            )
+
+            response = generate_chat_response(user_text)
+            chat_messages.controls.append(
+                ft.Container(
+                    content=ft.Text(response, size=14),
+                    bgcolor=ft.colors.GREY_100,
+                    border_radius=10,
+                    padding=12,
+                )
+            )
+
+            message_input.value = ""
+            page.update()
+
+        message_input.on_submit = send_clicked
+        send_button = ft.IconButton(icon=ft.icons.SEND, on_click=send_clicked)
+
+        return ft.Column(
+            [
+                ft.Text("Chatbot", size=22, weight=ft.FontWeight.W_600),
+                ft.Container(height=10),
+                ft.Container(content=chat_messages, expand=True, bgcolor=ft.colors.WHITE, border_radius=10, border=ft.border.all(1, ft.colors.GREY_200), padding=15),
+                ft.Container(height=10),
+                ft.Row([message_input, send_button]),
+            ],
+            expand=True,
+        )
+
     content_area = ft.Container(
         content=build_dashboard(),
         expand=True,
@@ -377,9 +477,8 @@ def main(page: ft.Page):
             content_area.content = build_predictions()
         elif selected_index == 3:
             content_area.content = build_risk_warnings()
-        else:
-            screens = ["Dashboard", "Weather", "Predictions", "Risk Warnings", "Chatbot"]
-            content_area.content = ft.Text(f"{screens[selected_index]} screen coming soon", size=24)
+        elif selected_index == 4:
+            content_area.content = build_chatbot()
         page.update()
 
     nav_rail = ft.NavigationRail(
