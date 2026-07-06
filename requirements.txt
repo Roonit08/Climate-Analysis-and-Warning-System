@@ -4,7 +4,7 @@ scikit-learn
 xgboost
 prophet
 tensorflow
-flet
+flet==0.24.1
 psycopg2-binary
 requests
 python-dotenv
