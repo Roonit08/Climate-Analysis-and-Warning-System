@@ -3,6 +3,7 @@ import flet as ft
 import json
 import sys
 import math
+import time
 import datetime
 import random
 import joblib
@@ -12,32 +13,54 @@ from pathlib import Path
 
 def main(page: ft.Page):
     page.title = "Terra Forecast"
-    page.window.width = 1150
-    page.window.height = 780
-    page.window.min_width = 950
+    page.window.width = 1250
+    page.window.height = 800
+    page.window.min_width = 1000
     page.window.min_height = 650
     page.padding = 0
 
     BASE_DIR = Path(__file__).resolve().parent.parent.parent
     with open(BASE_DIR / "data" / "country_coordinates.json") as f:
         country_coordinates = json.load(f)
-
     country_list = sorted(country_coordinates.keys())
 
     sys.path.append(str(BASE_DIR / "src" / "api"))
     sys.path.append(str(BASE_DIR / "src" / "disaster"))
-    from weather_client import get_current_weather, get_weekly_forecast
+    from weather_client import get_current_weather, get_weekly_forecast, get_extended_conditions
     from season_timing import get_seasonal_pattern
-    from risk_rules import assess_disaster_risk
+    from risk_rules import assess_disaster_risk, estimate_risk_percentages
 
     selected_country = {"name": "Nepal"}
-    theme_state = {"dark": False}
+    theme_state = {"dark": True}
     current_index = {"value": 0}
+
+    # ---------- Caches (fixes the navigation latency) ----------
+    CACHE_TTL = 300  # 5 minutes
+    weather_cache = {}
+    extended_cache = {}
+    forecast_cache = {}
+    season_cache = {}
+    trend_cache = {}
+    heatwave_cache = {}
+
+    def cached(cache_dict, key, fetch_fn, ttl=None):
+        now = time.time()
+        if key in cache_dict:
+            entry = cache_dict[key]
+            if ttl is None or (now - entry["time"]) < ttl:
+                return entry["data"]
+        data = fetch_fn()
+        cache_dict[key] = {"data": data, "time": now}
+        return data
+
+    def clear_live_caches(country_name):
+        weather_cache.pop(country_name, None)
+        extended_cache.pop(country_name, None)
+        forecast_cache.pop(country_name, None)
 
     lr_model = joblib.load(BASE_DIR / "saved_models" / "linear_regression_model.pkl")
     with open(BASE_DIR / "data" / "country_encoding_map.json") as f:
         country_encoding_map = json.load(f)
-
     historical_data = pd.read_csv(BASE_DIR / "data" / "model_ready_data.csv")
 
     heatwave_model = tf.keras.models.load_model(str(BASE_DIR / "saved_models" / "heatwave_nn_model.keras"))
@@ -52,15 +75,17 @@ def main(page: ft.Page):
         "Mountain regions like the Himalayas are warming faster than the global average.",
     ]
 
+    # ---------- Theme ----------
+
     def get_theme():
         if theme_state["dark"]:
-            return {"bg": "#0F172A", "card": "#1E293B", "border": "#334155", "text": ft.colors.WHITE,
-                    "subtext": ft.colors.GREY_400, "sky": ft.colors.LIGHT_BLUE_300, "sky_light": "#1E3A5F",
-                    "green": ft.colors.GREEN_300, "green_light": "#1E3A2F"}
+            return {"bg": "#0B1120", "card": "#161E2E", "border": "#2A3548", "text": ft.colors.WHITE,
+                    "subtext": ft.colors.GREY_400, "sky": ft.colors.LIGHT_BLUE_300, "sky_light": "#16324A",
+                    "green": ft.colors.GREEN_300, "green_light": "#173326", "sidebar": "#0E1526"}
         else:
             return {"bg": ft.colors.GREY_50, "card": ft.colors.WHITE, "border": ft.colors.GREY_200, "text": ft.colors.BLACK,
                     "subtext": ft.colors.GREY_700, "sky": ft.colors.LIGHT_BLUE_600, "sky_light": ft.colors.LIGHT_BLUE_50,
-                    "green": ft.colors.GREEN_600, "green_light": ft.colors.GREEN_50}
+                    "green": ft.colors.GREEN_600, "green_light": ft.colors.GREEN_50, "sidebar": ft.colors.WHITE}
 
     def refresh_current_screen():
         screens = [build_dashboard, build_weather, build_predictions, build_risk_warnings, build_settings]
@@ -70,10 +95,14 @@ def main(page: ft.Page):
     def apply_theme():
         theme = get_theme()
         page.theme_mode = ft.ThemeMode.DARK if theme_state["dark"] else ft.ThemeMode.LIGHT
-        nav_rail.bgcolor = theme["card"]
-        nav_rail.indicator_color = theme["sky_light"]
-        content_area.bgcolor = theme["bg"]
+        page.bgcolor = theme["bg"]
+        sidebar_container.bgcolor = theme["sidebar"]
+        topbar_container.bgcolor = theme["sidebar"]
+        rebuild_sidebar()
+        rebuild_topbar()
         refresh_current_screen()
+
+    # ---------- Helpers ----------
 
     def get_weather_icon(condition):
         c = condition.lower()
@@ -109,7 +138,7 @@ def main(page: ft.Page):
         else:
             return ["#1A237E", "#0D1B4C"]
 
-    def get_weather_text_color(condition, is_day):
+    def get_weather_text_color(condition):
         c = condition.lower()
         if "snow" in c or "fog" in c:
             return ft.colors.BLACK87
@@ -132,7 +161,7 @@ def main(page: ft.Page):
         else:
             return "Conditions look calm right now."
 
-    def predict_temperature_trend(country_name):
+    def compute_trend(country_name):
         country_data = historical_data[historical_data["Country Name"] == country_name].sort_values("year")
         if country_data.empty or country_name not in country_encoding_map:
             return None
@@ -155,7 +184,10 @@ def main(page: ft.Page):
             history.append(pred)
         return results
 
-    def predict_heatwave_risk(country_name):
+    def predict_temperature_trend(country_name):
+        return cached(trend_cache, country_name, lambda: compute_trend(country_name))
+
+    def compute_heatwave(country_name):
         country_data = historical_data[historical_data["Country Name"] == country_name].sort_values("year")
         if country_data.empty or country_name not in country_encoding_map:
             return None
@@ -169,6 +201,149 @@ def main(page: ft.Page):
         return {"probability": float(probability), "high_risk": bool(probability > heatwave_threshold),
                 "reference_year": int(latest["year"])}
 
+    def predict_heatwave_risk(country_name):
+        return cached(heatwave_cache, country_name, lambda: compute_heatwave(country_name))
+
+    def get_weather_cached(country_name):
+        lat, lon = country_coordinates[country_name]
+        return cached(weather_cache, country_name, lambda: get_current_weather(lat, lon), ttl=CACHE_TTL)
+
+    def get_extended_cached(country_name):
+        lat, lon = country_coordinates[country_name]
+        return cached(extended_cache, country_name, lambda: get_extended_conditions(lat, lon), ttl=CACHE_TTL)
+
+    def get_forecast_cached(country_name):
+        lat, lon = country_coordinates[country_name]
+        return cached(forecast_cache, country_name, lambda: get_weekly_forecast(lat, lon), ttl=CACHE_TTL)
+
+    def get_season_cached(country_name):
+        lat, lon = country_coordinates[country_name]
+        return cached(season_cache, country_name, lambda: get_seasonal_pattern(lat, lon))
+
+    # ---------- Top bar & sidebar ----------
+
+    def go_to(index):
+        def handler(e):
+            current_index["value"] = index
+            rebuild_sidebar()
+            refresh_current_screen()
+        return handler
+
+    def select_country_and_refresh(name):
+        selected_country["name"] = name
+        rebuild_topbar()
+        refresh_current_screen()
+
+    def search_submit(e):
+        theme = get_theme()
+        query = (e.control.value or "").strip().lower()
+        exact = next((c for c in country_list if c.lower() == query), None)
+        if not exact:
+            partial = [c for c in country_list if query in c.lower()]
+            exact = partial[0] if len(partial) == 1 else None
+        if exact:
+            select_country_and_refresh(exact)
+            e.control.value = ""
+            page.update()
+        else:
+            page.open(ft.SnackBar(ft.Text("Country not found — try the Dashboard search for suggestions.")))
+
+    def theme_toggle_clicked(e):
+        theme_state["dark"] = not theme_state["dark"]
+        apply_theme()
+
+    def refresh_clicked(e):
+        clear_live_caches(selected_country["name"])
+        refresh_current_screen()
+
+    def rebuild_topbar():
+        theme = get_theme()
+        topbar_container.content = ft.Row(
+            [
+                ft.Row(
+                    [
+                        ft.Container(content=ft.Text("TF", size=16, weight=ft.FontWeight.BOLD, color=ft.colors.WHITE),
+                                     bgcolor=theme["sky"], border_radius=8, width=36, height=36, alignment=ft.alignment.center),
+                        ft.Column([ft.Text("Terra Forecast", size=15, weight=ft.FontWeight.BOLD, color=theme["text"]),
+                                   ft.Text("Climate Workspace", size=11, color=theme["subtext"])], spacing=0),
+                    ],
+                    spacing=10,
+                ),
+                ft.Container(
+                    content=ft.TextField(hint_text="Search a country and press Enter...", prefix_icon=ft.icons.SEARCH,
+                                          border_radius=10, filled=True, bgcolor=theme["card"], color=theme["text"],
+                                          content_padding=ft.padding.symmetric(horizontal=14, vertical=10),
+                                          on_submit=search_submit, height=44),
+                    width=380,
+                ),
+                ft.Row(
+                    [
+                        ft.Container(
+                            content=ft.Row([ft.Icon(ft.icons.PLACE, color=theme["sky"], size=16),
+                                             ft.Text(selected_country["name"], size=13, weight=ft.FontWeight.BOLD, color=theme["text"])], spacing=6),
+                            bgcolor=theme["card"], border=ft.border.all(1, theme["border"]), border_radius=8,
+                            padding=ft.padding.symmetric(horizontal=12, vertical=8),
+                        ),
+                        ft.IconButton(icon=ft.icons.REFRESH, on_click=refresh_clicked, icon_color=theme["sky"], tooltip="Refresh live data"),
+                        ft.IconButton(icon=ft.icons.DARK_MODE if not theme_state["dark"] else ft.icons.LIGHT_MODE,
+                                      on_click=theme_toggle_clicked, icon_color=theme["sky"], tooltip="Toggle theme"),
+                    ],
+                    spacing=6,
+                ),
+            ],
+            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+        )
+
+    def rebuild_sidebar():
+        theme = get_theme()
+
+        def section_label(text):
+            return ft.Text(text, size=11, weight=ft.FontWeight.BOLD, color=theme["subtext"])
+
+        def nav_item(icon, label, index):
+            is_active = current_index["value"] == index
+            return ft.Container(
+                content=ft.Row([ft.Icon(icon, size=18, color=theme["sky"] if is_active else theme["subtext"]),
+                                 ft.Text(label, size=13, weight=ft.FontWeight.BOLD if is_active else ft.FontWeight.NORMAL,
+                                         color=theme["text"] if is_active else theme["subtext"])], spacing=10),
+                padding=ft.padding.symmetric(horizontal=14, vertical=10),
+                border_radius=8,
+                bgcolor=theme["sky_light"] if is_active else None,
+                on_click=go_to(index),
+                ink=True,
+            )
+
+        sidebar_container.content = ft.Column(
+            [
+                ft.Container(height=10),
+                section_label("OVERVIEW"),
+                nav_item(ft.icons.DASHBOARD_OUTLINED, "Dashboard", 0),
+                nav_item(ft.icons.WB_SUNNY_OUTLINED, "Live Weather", 1),
+                ft.Container(height=16),
+                section_label("ANALYSIS"),
+                nav_item(ft.icons.SHOW_CHART, "Climate Prediction", 2),
+                nav_item(ft.icons.WARNING_AMBER_OUTLINED, "Disaster Risk", 3),
+                ft.Container(height=16),
+                section_label("TOOLS"),
+                nav_item(ft.icons.SETTINGS_OUTLINED, "Settings", 4),
+                ft.Container(expand=True),
+                ft.Container(
+                    content=ft.Text("Data source: Open-Meteo\nModel: Linear Regression, TensorFlow", size=10, color=theme["subtext"]),
+                    padding=14,
+                ),
+            ],
+            spacing=3,
+        )
+
+    # ---------- Screens ----------
+
+    def screen_header(title, description):
+        theme = get_theme()
+        return ft.Column([
+            ft.Text(title, size=26, weight=ft.FontWeight.BOLD, color=theme["text"]),
+            ft.Text(description, size=13, color=theme["subtext"]),
+        ], spacing=4)
+
     def build_dashboard():
         theme = get_theme()
         search_query = {"text": ""}
@@ -176,9 +351,7 @@ def main(page: ft.Page):
 
         def select_country(name):
             def handler(e):
-                selected_country["name"] = name
-                content_area.content = build_dashboard()
-                page.update()
+                select_country_and_refresh(name)
             return handler
 
         def update_results():
@@ -186,22 +359,14 @@ def main(page: ft.Page):
             q = search_query["text"].strip().lower()
             if not q:
                 return
-            matches = [c for c in country_list if q in c.lower()][:8]
-            if not matches:
-                results_column.controls.append(ft.Text("No countries found", size=12, color=theme["subtext"]))
-                return
+            matches = [c for c in country_list if q in c.lower()][:6]
             for c in matches:
-                is_selected = c == selected_country["name"]
                 results_column.controls.append(
                     ft.Container(
-                        content=ft.Row(
-                            [ft.Icon(ft.icons.CHECK_CIRCLE if is_selected else ft.icons.PLACE_OUTLINED,
-                                    color=theme["green"] if is_selected else ft.colors.GREY_400, size=16),
-                             ft.Text(c, size=14, weight=ft.FontWeight.BOLD if is_selected else ft.FontWeight.NORMAL, color=theme["text"])],
-                            spacing=8),
-                        padding=ft.padding.symmetric(horizontal=12, vertical=10), border_radius=8,
-                        on_click=select_country(c), ink=True,
-                        bgcolor=theme["sky_light"] if is_selected else theme["card"],
+                        content=ft.Row([ft.Icon(ft.icons.PLACE_OUTLINED, color=theme["subtext"], size=16),
+                                         ft.Text(c, size=13, color=theme["text"])], spacing=8),
+                        padding=ft.padding.symmetric(horizontal=12, vertical=8), border_radius=8,
+                        on_click=select_country(c), ink=True, bgcolor=theme["card"],
                     )
                 )
 
@@ -210,29 +375,9 @@ def main(page: ft.Page):
             update_results()
             page.update()
 
-        search_field = ft.TextField(hint_text="Search for a country...", prefix_icon=ft.icons.SEARCH,
+        search_field = ft.TextField(hint_text="Search for a country to switch...", prefix_icon=ft.icons.SEARCH,
                                      on_change=search_changed, border_radius=10, filled=True,
                                      bgcolor=theme["card"], color=theme["text"])
-
-        hero = ft.Container(
-            content=ft.Column([ft.Text("Terra Forecast", size=32, weight=ft.FontWeight.BOLD, color=ft.colors.WHITE),
-                                ft.Text("Climate Analysis & Warning System", size=14, color=ft.colors.WHITE)], spacing=4),
-            gradient=ft.LinearGradient(begin=ft.alignment.top_left, end=ft.alignment.bottom_right,
-                                        colors=[ft.colors.LIGHT_BLUE_600, ft.colors.GREEN_600]),
-            padding=22, border_radius=14,
-        )
-
-        def stat_card(icon, label, value):
-            return ft.Container(
-                content=ft.Column([ft.Icon(icon, color=theme["sky"], size=22), ft.Text(value, size=18, weight=ft.FontWeight.BOLD, color=theme["text"]),
-                                    ft.Text(label, size=11, color=theme["subtext"])], spacing=4, horizontal_alignment=ft.CrossAxisAlignment.CENTER),
-                bgcolor=theme["card"], border_radius=10, border=ft.border.all(1, theme["border"]),
-                padding=15, expand=True, alignment=ft.alignment.center,
-            )
-
-        stats_row = ft.Row([stat_card(ft.icons.PUBLIC, "Countries Tracked", "226"),
-                             stat_card(ft.icons.CALENDAR_MONTH, "Years of Data", "51"),
-                             stat_card(ft.icons.INSIGHTS, "Forecast Horizon", "2050")], spacing=12)
 
         country_name = selected_country["name"]
         country_hist = historical_data[historical_data["Country Name"] == country_name].sort_values("year")
@@ -242,83 +387,167 @@ def main(page: ft.Page):
         trend_result = predict_temperature_trend(country_name)
         year_2050_val = trend_result["values"][-1] if trend_result else None
 
-        if latest_val is not None and year_2050_val is not None:
-            is_rising = year_2050_val > latest_val
-            trend_icon = ft.icons.TRENDING_UP if is_rising else ft.icons.TRENDING_DOWN
-            trend_color = ft.colors.ORANGE_700 if is_rising else theme["green"]
-            trend_label = "Warming"
-        else:
-            trend_icon, trend_color, trend_label = ft.icons.HELP_OUTLINE, ft.colors.GREY_400, "Unknown"
+        try:
+            weather = get_weather_cached(country_name)
+        except Exception:
+            weather = None
 
-        def mini_stat(icon, label, value, color):
-            children = [ft.Icon(icon, color=color, size=20)]
-            if value:
-                children.append(ft.Text(value, size=16, weight=ft.FontWeight.BOLD, color=theme["text"]))
-            children.append(ft.Text(label, size=11, color=theme["subtext"]))
-            return ft.Column(children, spacing=2, horizontal_alignment=ft.CrossAxisAlignment.CENTER)
-
-        selected_card = ft.Container(
+        active_country_card = ft.Container(
             content=ft.Column([
-                ft.Row([ft.Icon(ft.icons.PLACE, color=theme["sky"]), ft.Text(country_name, size=20, weight=ft.FontWeight.BOLD, color=theme["text"])], spacing=8),
-                ft.Container(height=12),
-                ft.Row([mini_stat(ft.icons.THERMOSTAT, f"Latest ({latest_year})" if latest_year else "Latest",
-                                   f"{latest_val:.2f}°C" if latest_val is not None else "N/A", theme["sky"]),
-                        ft.Container(width=25),
-                        mini_stat(ft.icons.INSIGHTS, "Predicted 2050", f"{year_2050_val:.2f}°C" if year_2050_val is not None else "N/A", theme["green"]),
-                        ft.Container(width=25),
-                        mini_stat(trend_icon, trend_label, "", trend_color)], wrap=True),
+                ft.Row([ft.Container(content=ft.Text("Active Country", size=11, weight=ft.FontWeight.BOLD, color=theme["sky"]),
+                                      bgcolor=theme["sky_light"], padding=ft.padding.symmetric(horizontal=10, vertical=4), border_radius=20),
+                        ft.Container(expand=True),
+                        ft.Text("1971 – 2050", size=11, color=theme["subtext"])]),
+                ft.Container(height=10),
+                ft.Text(country_name, size=30, weight=ft.FontWeight.BOLD, color=theme["text"]),
+                ft.Container(height=6),
+                ft.Text(f"Latest recorded anomaly {latest_val:.2f}°C. Historical records combined with live data power every screen." if latest_val is not None else "No historical data available.",
+                        size=12, color=theme["subtext"]),
+                ft.Container(height=14),
+                ft.Row([
+                    ft.Container(content=ft.Text("51 records", size=11, color=theme["green"]), bgcolor=theme["green_light"], border_radius=6, padding=ft.padding.symmetric(horizontal=10, vertical=5)),
+                    ft.Container(content=ft.Text("2050 horizon", size=11, color=theme["sky"]), bgcolor=theme["sky_light"], border_radius=6, padding=ft.padding.symmetric(horizontal=10, vertical=5)),
+                    ft.Container(content=ft.Text("Live weather linked", size=11, color=ft.colors.ORANGE_600),
+                                 bgcolor=(ft.colors.ORANGE_50 if not theme_state["dark"] else "#3D2A1A"), border_radius=6, padding=ft.padding.symmetric(horizontal=10, vertical=5)),
+                ], spacing=8, wrap=True),
             ]),
-            bgcolor=theme["card"], border_radius=12, border=ft.border.all(1, theme["border"]), padding=18,
+            bgcolor=theme["card"], border_radius=14, border=ft.border.all(1, theme["border"]), padding=22, expand=True,
         )
 
+        if weather:
+            icon, icon_color = get_weather_icon(weather["condition"])
+            weather_card = ft.Container(
+                content=ft.Column([
+                    ft.Row([ft.Icon(icon, color=icon_color, size=24),
+                            ft.Container(expand=True),
+                            ft.Container(content=ft.Text("Live", size=10, weight=ft.FontWeight.BOLD, color=ft.colors.ORANGE_600),
+                                         bgcolor=(ft.colors.ORANGE_50 if not theme_state["dark"] else "#3D2A1A"), padding=ft.padding.symmetric(horizontal=8, vertical=3), border_radius=20)]),
+                    ft.Container(height=10),
+                    ft.Text(f"{weather['temperature']}°C", size=30, weight=ft.FontWeight.BOLD, color=theme["text"]),
+                    ft.Text(weather["condition"], size=13, color=theme["subtext"]),
+                ]),
+                bgcolor=theme["card"], border_radius=14, border=ft.border.all(1, theme["border"]), padding=22, width=260,
+            )
+        else:
+            weather_card = ft.Container(content=ft.Text("Live weather unavailable", color=theme["subtext"]),
+                                          bgcolor=theme["card"], border_radius=14, border=ft.border.all(1, theme["border"]), padding=22, width=260)
+
+        heatwave_result = predict_heatwave_risk(country_name)
+
+        def metric_card(icon, label, value, description, color):
+            return ft.Container(
+                content=ft.Column([
+                    ft.Row([ft.Icon(icon, color=color, size=18), ft.Text(label, size=11, weight=ft.FontWeight.BOLD, color=theme["subtext"])], spacing=8),
+                    ft.Container(height=10),
+                    ft.Text(value, size=24, weight=ft.FontWeight.BOLD, color=theme["text"]),
+                    ft.Text(description, size=11, color=theme["subtext"]),
+                ]),
+                bgcolor=theme["card"], border_radius=12, border=ft.border.all(1, theme["border"]), padding=18, expand=True,
+            )
+
+        metrics_row = ft.Row([
+            metric_card(ft.icons.SHOW_CHART, "TEMPERATURE TREND", f"{year_2050_val:.2f}°C" if year_2050_val is not None else "N/A",
+                        "Projected anomaly by 2050.", theme["sky"]),
+            metric_card(ft.icons.WARNING_AMBER, "RISK LEVEL", "Elevated" if heatwave_result and heatwave_result["high_risk"] else "Normal",
+                        "Latest neural-network heatwave classification.", ft.colors.RED_400 if heatwave_result and heatwave_result["high_risk"] else theme["green"]),
+            metric_card(ft.icons.CALENDAR_MONTH, "COUNTRIES TRACKED", "226", "Full global coverage across the dataset.", theme["green"]),
+        ], spacing=14)
+
         fact_card = ft.Container(
-            content=ft.Row([ft.Icon(ft.icons.LIGHTBULB, color=ft.colors.AMBER_600, size=22),
-                             ft.Text(random.choice(CLIMATE_FACTS), size=13, color=theme["text"], expand=True)], spacing=10),
+            content=ft.Row([ft.Icon(ft.icons.LIGHTBULB, color=ft.colors.AMBER_600, size=20),
+                             ft.Text(random.choice(CLIMATE_FACTS), size=12, color=theme["text"], expand=True)], spacing=10),
             bgcolor=theme["sky_light"], border_radius=10, padding=14,
         )
 
-        def go_to(index):
-            def handler(e):
-                current_index["value"] = index
-                nav_rail.selected_index = index
-                refresh_current_screen()
-            return handler
-
-        quick_actions = ft.Row([
-            ft.ElevatedButton("View Weather", icon=ft.icons.WB_SUNNY, on_click=go_to(1), bgcolor=theme["sky_light"], color=theme["sky"]),
-            ft.ElevatedButton("2050 Forecast", icon=ft.icons.SHOW_CHART, on_click=go_to(2), bgcolor=theme["green_light"], color=theme["green"]),
-            ft.ElevatedButton("Check Risk", icon=ft.icons.WARNING_AMBER, on_click=go_to(3),
-                               bgcolor=ft.colors.ORANGE_50 if not theme_state["dark"] else "#3D2A1A", color=ft.colors.ORANGE_700),
-        ], wrap=True, spacing=10)
+        preview_row = ft.Row([
+            ft.Container(
+                content=ft.Column([
+                    ft.Row([ft.Text("Climate Trends", size=14, weight=ft.FontWeight.BOLD, color=theme["text"]),
+                            ft.Container(expand=True),
+                            ft.Container(content=ft.Text("Open →", size=11, color=theme["sky"]), on_click=go_to(2), ink=True)]),
+                    ft.Text("Historical and projected anomaly through 2050 with an interactive chart.", size=11, color=theme["subtext"]),
+                ]),
+                bgcolor=theme["card"], border_radius=12, border=ft.border.all(1, theme["border"]), padding=18, expand=True, on_click=go_to(2), ink=True,
+            ),
+            ft.Container(
+                content=ft.Column([
+                    ft.Row([ft.Text("Disaster Risk", size=14, weight=ft.FontWeight.BOLD, color=theme["text"]),
+                            ft.Container(expand=True),
+                            ft.Container(content=ft.Text("Open →", size=11, color=theme["sky"]), on_click=go_to(3), ink=True)]),
+                    ft.Text("Live flood, storm, and heat risk percentages based on current conditions.", size=11, color=theme["subtext"]),
+                ]),
+                bgcolor=theme["card"], border_radius=12, border=ft.border.all(1, theme["border"]), padding=18, expand=True, on_click=go_to(3), ink=True,
+            ),
+        ], spacing=14)
 
         update_results()
 
         content = ft.Column([
-            hero, ft.Container(height=14), stats_row, ft.Container(height=14), fact_card, ft.Container(height=16),
-            ft.Text("Select Your Country", size=17, weight=ft.FontWeight.W_600, color=theme["text"]),
-            ft.Container(height=6), search_field, results_column, ft.Container(height=10),
-            selected_card, ft.Container(height=16), quick_actions,
+            screen_header("Dashboard", f"Operational climate overview for {country_name}. One country, one focal model, supporting signals around it."),
+            ft.Container(height=16),
+            ft.Row([active_country_card, weather_card], spacing=14),
+            ft.Container(height=14),
+            metrics_row,
+            ft.Container(height=14),
+            fact_card,
+            ft.Container(height=14),
+            preview_row,
+            ft.Container(height=20),
+            ft.Text("Switch Country", size=14, weight=ft.FontWeight.BOLD, color=theme["text"]),
+            ft.Container(height=6),
+            search_field,
+            results_column,
         ], scroll=ft.ScrollMode.AUTO)
 
-        return ft.Container(content=content, padding=30, expand=True, bgcolor=theme["bg"])
+        return ft.Container(content=content, padding=28, expand=True, bgcolor=theme["bg"])
 
     def build_weather():
         theme = get_theme()
         country_name = selected_country["name"]
-        lat, lon = country_coordinates[country_name]
 
-        def refresh_clicked(e):
-            content_area.content = build_weather()
-            page.update()
+        def do_refresh(e):
+            clear_live_caches(country_name)
+            refresh_current_screen()
 
         try:
-            weather = get_current_weather(lat, lon)
+            weather = get_weather_cached(country_name)
             icon, icon_color = get_weather_icon(weather["condition"])
             outlook = get_outlook_text(weather["temperature"], weather["condition"])
             wind_deg = weather.get("winddirection", 0)
             grad_colors = get_condition_gradient(weather["condition"], weather["is_day"])
-            text_color = get_weather_text_color(weather["condition"], weather["is_day"])
+            text_color = get_weather_text_color(weather["condition"])
             sub_color = ft.colors.with_opacity(0.85, text_color)
+
+            try:
+                extended = get_extended_cached(country_name)
+                humidity = extended["humidity"]
+                rain_chance = extended["rain_chance"]
+            except Exception:
+                humidity, rain_chance = None, None
+
+            extra_stats = ft.Row([
+                ft.Column([ft.Row([ft.Container(content=ft.Icon(ft.icons.NAVIGATION, color=text_color, size=20),
+                                                 rotate=ft.transform.Rotate(angle=math.radians(wind_deg))),
+                                    ft.Text(f"{weather['windspeed']} km/h", size=15, weight=ft.FontWeight.BOLD, color=text_color)], spacing=8),
+                           ft.Text("Wind", size=11, color=sub_color)], spacing=4),
+                ft.Container(width=35),
+                ft.Column([ft.Icon(ft.icons.WB_TWILIGHT if weather["is_day"] else ft.icons.NIGHTLIGHT_ROUND, color=text_color, size=20),
+                           ft.Text("Day" if weather["is_day"] else "Night", size=15, weight=ft.FontWeight.BOLD, color=text_color)], spacing=4),
+                ft.Container(width=35),
+                ft.Column([ft.Icon(ft.icons.WATER_DROP, color=text_color, size=20),
+                           ft.Text(f"{humidity}%" if humidity is not None else "N/A", size=15, weight=ft.FontWeight.BOLD, color=text_color)], spacing=4),
+                ft.Text("Humidity", size=11, color=sub_color) if False else ft.Container(),
+                ft.Container(width=35),
+                ft.Column([ft.Icon(ft.icons.UMBRELLA, color=text_color, size=20),
+                           ft.Text(f"{rain_chance}%" if rain_chance is not None else "N/A", size=15, weight=ft.FontWeight.BOLD, color=text_color)], spacing=4),
+            ])
+
+            labels_row = ft.Row([
+                ft.Container(width=42), ft.Text("Wind", size=10, color=sub_color), ft.Container(width=64),
+                ft.Text("Status", size=10, color=sub_color), ft.Container(width=64),
+                ft.Text("Humidity", size=10, color=sub_color), ft.Container(width=64),
+                ft.Text("Rain Chance", size=10, color=sub_color),
+            ])
 
             current_section = ft.Container(
                 content=ft.Column([
@@ -327,26 +556,17 @@ def main(page: ft.Page):
                                        ft.Text(weather["condition"], size=16, color=sub_color)], spacing=0)], spacing=18),
                     ft.Container(height=8),
                     ft.Text(outlook, size=14, italic=True, color=sub_color),
-                    ft.Container(height=18),
-                    ft.Row([
-                        ft.Column([ft.Row([ft.Container(content=ft.Icon(ft.icons.NAVIGATION, color=text_color, size=20),
-                                                         rotate=ft.transform.Rotate(angle=math.radians(wind_deg))),
-                                            ft.Text(f"{weather['windspeed']} km/h", size=15, weight=ft.FontWeight.BOLD, color=text_color)], spacing=8),
-                                   ft.Text("Wind", size=11, color=sub_color)], spacing=4),
-                        ft.Container(width=45),
-                        ft.Column([ft.Icon(ft.icons.WB_TWILIGHT if weather["is_day"] else ft.icons.NIGHTLIGHT_ROUND, color=text_color, size=20),
-                                   ft.Text("Day" if weather["is_day"] else "Night", size=15, weight=ft.FontWeight.BOLD, color=text_color)], spacing=4),
-                    ]),
+                    ft.Container(height=20),
+                    extra_stats,
                 ]),
                 gradient=ft.LinearGradient(begin=ft.alignment.top_left, end=ft.alignment.bottom_right, colors=grad_colors),
                 border_radius=16, padding=26,
             )
         except Exception as ex:
             current_section = ft.Text(f"Could not load weather data: {ex}", color=ft.colors.RED)
-            grad_colors = None
 
         try:
-            forecast = get_weekly_forecast(lat, lon)
+            forecast = get_forecast_cached(country_name)
             day_cards = []
             for day in forecast:
                 d = datetime.datetime.strptime(day["date"], "%Y-%m-%d")
@@ -370,12 +590,13 @@ def main(page: ft.Page):
             forecast_section = ft.Text("7-day forecast temporarily unavailable", color=theme["subtext"])
 
         content = ft.Column([
-            ft.Row([ft.Text(country_name, size=26, weight=ft.FontWeight.BOLD, color=theme["text"]),
-                    ft.IconButton(icon=ft.icons.REFRESH, on_click=refresh_clicked, icon_color=theme["sky"])]),
-            ft.Container(height=8), current_section, ft.Container(height=22), forecast_section,
+            screen_header("Live Weather", f"Real-time conditions for {country_name}, refreshed from Open-Meteo every few minutes."),
+            ft.Container(height=4),
+            ft.Row([ft.Container(expand=True), ft.IconButton(icon=ft.icons.REFRESH, on_click=do_refresh, icon_color=theme["sky"])]),
+            current_section, ft.Container(height=22), forecast_section,
         ], spacing=5, scroll=ft.ScrollMode.AUTO)
 
-        return ft.Container(content=content, padding=30, expand=True, bgcolor=theme["bg"])
+        return ft.Container(content=content, padding=28, expand=True, bgcolor=theme["bg"])
 
     def build_predictions():
         theme = get_theme()
@@ -383,7 +604,7 @@ def main(page: ft.Page):
         result = predict_temperature_trend(country_name)
 
         if result is None:
-            return ft.Container(content=ft.Text(f"No prediction data available for {country_name}", color=ft.colors.RED), padding=30)
+            return ft.Container(content=ft.Text(f"No prediction data available for {country_name}", color=ft.colors.RED), padding=28)
 
         data_points = [ft.LineChartDataPoint(x, y) for x, y in zip(result["years"], result["values"])]
         min_year, max_year = min(result["years"]), max(result["years"])
@@ -398,13 +619,14 @@ def main(page: ft.Page):
         y_interval = round((max_val - min_val) / 5, 1) or 0.5
 
         chart = ft.LineChart(
-            data_series=[ft.LineChartData(data_points=data_points, stroke_width=3, color=theme["sky"], curved=True, stroke_cap_round=True)],
+            data_series=[ft.LineChartData(data_points=data_points, stroke_width=3, color=theme["sky"], curved=True,
+                                           stroke_cap_round=True, point=False)],
             border=ft.border.all(1, theme["border"]),
             horizontal_grid_lines=ft.ChartGridLines(interval=y_interval, color=theme["border"], width=1),
             vertical_grid_lines=ft.ChartGridLines(interval=10, color=theme["border"], width=1),
             left_axis=ft.ChartAxis(title=ft.Text("°C", size=12, color=theme["subtext"]), title_size=20, labels_size=45),
             bottom_axis=ft.ChartAxis(title=ft.Text("Year", size=12, color=theme["subtext"]), title_size=20, labels_size=28, labels=bottom_labels),
-            min_y=min_val - 0.3, max_y=max_val + 0.3, min_x=min_year, max_x=max_year,
+            min_y=min_val - 0.3, max_y=max_val + 0.4, min_x=min_year, max_x=max_year,
             tooltip_bgcolor=theme["card"], expand=True,
         )
 
@@ -418,7 +640,6 @@ def main(page: ft.Page):
             bgcolor=badge_bg, border_radius=20, padding=ft.padding.symmetric(horizontal=14, vertical=6),
         )
 
-        # Year search feature
         year_result_text = ft.Text("", size=15, weight=ft.FontWeight.BOLD, color=theme["text"])
         year_input = ft.TextField(label="Search a year (e.g. 2030)", width=220, border_radius=8)
 
@@ -434,8 +655,8 @@ def main(page: ft.Page):
             elif year_val in result["years"]:
                 idx = result["years"].index(year_val)
                 val = result["values"][idx]
-                label = "recorded" if year_val <= 2021 else "predicted"
-                year_result_text.value = f"{label.capitalize()} change in {year_val}: {val:.2f}°C"
+                label = "Recorded" if year_val <= 2021 else "Predicted"
+                year_result_text.value = f"{label} change in {year_val}: {val:.2f}°C"
             else:
                 year_result_text.value = "No data available for that year."
             page.update()
@@ -443,21 +664,21 @@ def main(page: ft.Page):
         year_search_card = ft.Container(
             content=ft.Column([
                 ft.Text("Check a Specific Year", size=16, weight=ft.FontWeight.W_600, color=theme["text"]),
+                ft.Text("Look up the recorded or predicted temperature change for any year between 1971 and 2050.", size=11, color=theme["subtext"]),
                 ft.Container(height=10),
                 ft.Row([year_input, ft.ElevatedButton("Check", on_click=check_year, bgcolor=theme["sky_light"], color=theme["sky"])], spacing=10),
-                ft.Container(height=8),
-                year_result_text,
+                ft.Container(height=8), year_result_text,
             ]),
             bgcolor=theme["card"], border_radius=10, border=ft.border.all(1, theme["border"]), padding=20,
         )
 
-        lat, lon = country_coordinates[country_name]
         try:
-            seasonal_info = get_seasonal_pattern(lat, lon)
+            seasonal_info = get_season_cached(country_name)
             season_section = ft.Container(
                 content=ft.Column([
                     ft.Text("Seasonal Pattern", size=18, weight=ft.FontWeight.W_600, color=theme["text"]),
-                    ft.Container(height=10),
+                    ft.Text("Derived from 5 years of historical daily temperature data using Prophet.", size=11, color=theme["subtext"]),
+                    ft.Container(height=12),
                     ft.Row([
                         ft.Column([ft.Text("🔥 Summer", size=12, color=theme["subtext"]),
                                    ft.Text(seasonal_info["summer_range"], size=16, weight=ft.FontWeight.BOLD, color=ft.colors.ORANGE_700),
@@ -474,15 +695,17 @@ def main(page: ft.Page):
             season_section = ft.Text("Seasonal data temporarily unavailable", color=theme["subtext"])
 
         content = ft.Column([
-            ft.Row([ft.Text(f"{country_name} — Temperature Trend to 2050", size=22, weight=ft.FontWeight.W_600, color=theme["text"]), badge], spacing=15, wrap=True),
-            ft.Text(f"Predicted change by 2050: {year_2050_value:.2f}°C", size=14, color=theme["subtext"]),
+            screen_header("Climate Prediction", f"Long-term temperature trend and seasonal pattern analysis for {country_name}, powered by Linear Regression and Prophet."),
+            ft.Container(height=14),
+            ft.Row([ft.Text(f"Predicted change by 2050: {year_2050_value:.2f}°C", size=14, color=theme["subtext"]), badge], spacing=15, wrap=True),
             ft.Container(height=15),
-            ft.Container(content=chart, height=320, padding=ft.padding.only(top=15, right=20, bottom=5),
+            ft.Container(content=chart, height=340, clip_behavior=ft.ClipBehavior.HARD_EDGE,
+                         padding=ft.padding.only(top=40, right=20, bottom=5, left=5),
                          bgcolor=theme["card"], border_radius=10, border=ft.border.all(1, theme["border"])),
             ft.Container(height=18), year_search_card, ft.Container(height=18), season_section,
         ], spacing=5, scroll=ft.ScrollMode.AUTO)
 
-        return ft.Container(content=content, padding=30, expand=True, bgcolor=theme["bg"])
+        return ft.Container(content=content, padding=28, expand=True, bgcolor=theme["bg"])
 
     def build_risk_warnings():
         theme = get_theme()
@@ -494,15 +717,12 @@ def main(page: ft.Page):
         else:
             risk_level_text = "Elevated Risk" if heatwave_result["high_risk"] else "Normal Conditions"
             risk_color = ft.colors.RED_700 if heatwave_result["high_risk"] else theme["green"]
-            if heatwave_result["high_risk"]:
-                risk_bg = ft.colors.RED_50 if not theme_state["dark"] else "#3D1A1A"
-            else:
-                risk_bg = theme["green_light"]
+            risk_bg = (ft.colors.RED_50 if not theme_state["dark"] else "#3D1A1A") if heatwave_result["high_risk"] else theme["green_light"]
 
             heatwave_card = ft.Container(
                 content=ft.Column([
                     ft.Row([ft.Icon(ft.icons.WHATSHOT, color=risk_color, size=28), ft.Text("Heatwave Risk", size=18, weight=ft.FontWeight.W_600, color=theme["text"])]),
-                    ft.Text(f"Based on climate trend data through {heatwave_result['reference_year']}", size=11, color=theme["subtext"], italic=True),
+                    ft.Text(f"Based on climate trend data through {heatwave_result['reference_year']} — not a daily forecast.", size=11, color=theme["subtext"], italic=True),
                     ft.Container(height=10),
                     ft.Text(risk_level_text, size=22, weight=ft.FontWeight.BOLD, color=risk_color),
                     ft.Container(height=8),
@@ -513,10 +733,32 @@ def main(page: ft.Page):
                 bgcolor=risk_bg, border_radius=10, border=ft.border.all(1, risk_color), padding=20,
             )
 
-        lat, lon = country_coordinates[country_name]
         try:
-            current_weather = get_current_weather(lat, lon)
+            current_weather = get_weather_cached(country_name)
             disaster_flags = assess_disaster_risk(current_weather)
+            percentages = estimate_risk_percentages(current_weather)
+
+            def risk_bar(label, icon, pct, color):
+                return ft.Column([
+                    ft.Row([ft.Icon(icon, color=color, size=16), ft.Text(label, size=12, color=theme["text"]),
+                            ft.Container(expand=True), ft.Text(f"{pct}%", size=12, weight=ft.FontWeight.BOLD, color=color)]),
+                    ft.ProgressBar(value=pct / 100, color=color, bgcolor=theme["border"], height=8, border_radius=4),
+                ], spacing=6)
+
+            percentages_section = ft.Container(
+                content=ft.Column([
+                    ft.Text("Estimated Risk Levels", size=15, weight=ft.FontWeight.W_600, color=theme["text"]),
+                    ft.Text("Rule-based estimates from current wind, rain, and temperature conditions.", size=11, color=theme["subtext"]),
+                    ft.Container(height=14),
+                    risk_bar("Flood Risk", ft.icons.WATER, percentages["flood_pct"], theme["sky"]),
+                    ft.Container(height=10),
+                    risk_bar("Storm / High Wind Risk", ft.icons.AIR, percentages["storm_pct"], ft.colors.DEEP_PURPLE_300),
+                    ft.Container(height=10),
+                    risk_bar("Extreme Heat Risk", ft.icons.WHATSHOT, percentages["heat_pct"], ft.colors.ORANGE_600),
+                ]),
+                bgcolor=theme["card"], border_radius=10, border=ft.border.all(1, theme["border"]), padding=20,
+            )
+
             disaster_items = []
             for flag in disaster_flags:
                 is_safe = flag == "No significant weather-based risk detected"
@@ -526,13 +768,14 @@ def main(page: ft.Page):
             disaster_card = ft.Container(
                 content=ft.Column([
                     ft.Text("Live Disaster Risk Monitor", size=18, weight=ft.FontWeight.W_600, color=theme["text"]),
-                    ft.Text("Based on real-time current weather conditions", size=11, color=theme["subtext"], italic=True),
+                    ft.Text("Based on real-time current weather conditions, refreshed periodically.", size=11, color=theme["subtext"], italic=True),
                     ft.Container(height=10), *disaster_items,
                 ]),
                 bgcolor=theme["card"], border_radius=10, border=ft.border.all(1, theme["border"]), padding=20,
             )
         except Exception:
-            disaster_card = ft.Text("Live disaster data temporarily unavailable", color=theme["subtext"])
+            percentages_section = ft.Text("Live risk data temporarily unavailable", color=theme["subtext"])
+            disaster_card = ft.Container()
 
         country_hist = historical_data[historical_data["Country Name"] == country_name]
         if not country_hist.empty:
@@ -561,12 +804,13 @@ def main(page: ft.Page):
         )
 
         content = ft.Column([
-            ft.Text(f"{country_name} — Risk Warnings", size=22, weight=ft.FontWeight.W_600, color=theme["text"]),
-            ft.Container(height=15), heatwave_card, ft.Container(height=18),
+            screen_header("Disaster Risk Analysis", f"Combined long-term risk classification and live monitoring for {country_name}."),
+            ft.Container(height=14), heatwave_card, ft.Container(height=18),
+            percentages_section, ft.Container(height=18),
             disaster_card, ft.Container(height=18), extreme_card, ft.Container(height=18), safety_tips,
         ], spacing=5, scroll=ft.ScrollMode.AUTO)
 
-        return ft.Container(content=content, padding=30, expand=True, bgcolor=theme["bg"])
+        return ft.Container(content=content, padding=28, expand=True, bgcolor=theme["bg"])
 
     def build_settings():
         theme = get_theme()
@@ -576,7 +820,7 @@ def main(page: ft.Page):
             apply_theme()
 
         content = ft.Column([
-            ft.Text("Settings", size=22, weight=ft.FontWeight.W_600, color=theme["text"]),
+            screen_header("Settings", "Manage app appearance and view build information."),
             ft.Container(height=20),
             ft.Container(
                 content=ft.Row([
@@ -600,28 +844,22 @@ def main(page: ft.Page):
             ),
         ], scroll=ft.ScrollMode.AUTO)
 
-        return ft.Container(content=content, padding=30, expand=True, bgcolor=theme["bg"])
+        return ft.Container(content=content, padding=28, expand=True, bgcolor=theme["bg"])
+
+    # ---------- Layout shell ----------
 
     content_area = ft.Container(content=None, expand=True, padding=0)
+    sidebar_container = ft.Container(width=220, padding=10)
+    topbar_container = ft.Container(padding=ft.padding.symmetric(horizontal=20, vertical=12))
 
-    def nav_changed(e):
-        current_index["value"] = e.control.selected_index
-        refresh_current_screen()
-
-    nav_rail = ft.NavigationRail(
-        selected_index=0, label_type=ft.NavigationRailLabelType.ALL, min_width=100, min_extended_width=200,
-        bgcolor=ft.colors.WHITE, indicator_color=ft.colors.LIGHT_BLUE_50,
-        destinations=[
-            ft.NavigationRailDestination(icon=ft.icons.DASHBOARD_OUTLINED, selected_icon=ft.icons.DASHBOARD, label="Dashboard"),
-            ft.NavigationRailDestination(icon=ft.icons.WB_SUNNY_OUTLINED, selected_icon=ft.icons.WB_SUNNY, label="Weather"),
-            ft.NavigationRailDestination(icon=ft.icons.SHOW_CHART_OUTLINED, selected_icon=ft.icons.SHOW_CHART, label="Predictions"),
-            ft.NavigationRailDestination(icon=ft.icons.WARNING_AMBER_OUTLINED, selected_icon=ft.icons.WARNING_AMBER, label="Risk"),
-            ft.NavigationRailDestination(icon=ft.icons.SETTINGS_OUTLINED, selected_icon=ft.icons.SETTINGS, label="Settings"),
-        ],
-        on_change=nav_changed,
+    page.add(
+        ft.Column([
+            topbar_container,
+            ft.Divider(height=1),
+            ft.Row([sidebar_container, ft.VerticalDivider(width=1), content_area], expand=True),
+        ], expand=True, spacing=0)
     )
 
-    page.add(ft.Row([nav_rail, ft.VerticalDivider(width=1), content_area], expand=True))
     apply_theme()
 
 ft.app(target=main)
