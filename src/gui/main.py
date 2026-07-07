@@ -34,7 +34,7 @@ def main(page: ft.Page):
     theme_state = {"dark": True}
     current_index = {"value": 0}
 
-    # ---------- Caches (fixes the navigation latency) ----------
+# Caches (fixes the navigation latency)
     CACHE_TTL = 300  # 5 minutes
     weather_cache = {}
     extended_cache = {}
@@ -75,7 +75,7 @@ def main(page: ft.Page):
         "Mountain regions like the Himalayas are warming faster than the global average.",
     ]
 
-    # ---------- Theme ----------
+# Theme 
 
     def get_theme():
         if theme_state["dark"]:
@@ -102,7 +102,7 @@ def main(page: ft.Page):
         rebuild_topbar()
         refresh_current_screen()
 
-    # ---------- Helpers ----------
+ # Helpers 
 
     def get_weather_icon(condition):
         c = condition.lower()
@@ -220,7 +220,7 @@ def main(page: ft.Page):
         lat, lon = country_coordinates[country_name]
         return cached(season_cache, country_name, lambda: get_seasonal_pattern(lat, lon))
 
-    # ---------- Top bar & sidebar ----------
+# Top bar & sidebar 
 
     def go_to(index):
         def handler(e):
@@ -335,7 +335,7 @@ def main(page: ft.Page):
             spacing=3,
         )
 
-    # ---------- Screens ----------
+# Screens
 
     def screen_header(title, description):
         theme = get_theme()
@@ -346,38 +346,6 @@ def main(page: ft.Page):
 
     def build_dashboard():
         theme = get_theme()
-        search_query = {"text": ""}
-        results_column = ft.Column(spacing=4)
-
-        def select_country(name):
-            def handler(e):
-                select_country_and_refresh(name)
-            return handler
-
-        def update_results():
-            results_column.controls.clear()
-            q = search_query["text"].strip().lower()
-            if not q:
-                return
-            matches = [c for c in country_list if q in c.lower()][:6]
-            for c in matches:
-                results_column.controls.append(
-                    ft.Container(
-                        content=ft.Row([ft.Icon(ft.icons.PLACE_OUTLINED, color=theme["subtext"], size=16),
-                                         ft.Text(c, size=13, color=theme["text"])], spacing=8),
-                        padding=ft.padding.symmetric(horizontal=12, vertical=8), border_radius=8,
-                        on_click=select_country(c), ink=True, bgcolor=theme["card"],
-                    )
-                )
-
-        def search_changed(e):
-            search_query["text"] = e.control.value
-            update_results()
-            page.update()
-
-        search_field = ft.TextField(hint_text="Search for a country to switch...", prefix_icon=ft.icons.SEARCH,
-                                     on_change=search_changed, border_radius=10, filled=True,
-                                     bgcolor=theme["card"], color=theme["text"])
 
         country_name = selected_country["name"]
         country_hist = historical_data[historical_data["Country Name"] == country_name].sort_values("year")
@@ -480,8 +448,6 @@ def main(page: ft.Page):
             ),
         ], spacing=14)
 
-        update_results()
-
         content = ft.Column([
             screen_header("Dashboard", f"Operational climate overview for {country_name}. One country, one focal model, supporting signals around it."),
             ft.Container(height=16),
@@ -492,11 +458,6 @@ def main(page: ft.Page):
             fact_card,
             ft.Container(height=14),
             preview_row,
-            ft.Container(height=20),
-            ft.Text("Switch Country", size=14, weight=ft.FontWeight.BOLD, color=theme["text"]),
-            ft.Container(height=6),
-            search_field,
-            results_column,
         ], scroll=ft.ScrollMode.AUTO)
 
         return ft.Container(content=content, padding=28, expand=True, bgcolor=theme["bg"])
@@ -819,34 +780,121 @@ def main(page: ft.Page):
             theme_state["dark"] = e.control.value
             apply_theme()
 
+        theme_card = ft.Container(
+            content=ft.Row([
+                ft.Icon(ft.icons.DARK_MODE, color=theme["sky"]),
+                ft.Column([ft.Text("Dark Mode", size=15, weight=ft.FontWeight.BOLD, color=theme["text"]),
+                           ft.Text("Switch between light and dark theme", size=12, color=theme["subtext"])], spacing=2, expand=True),
+                ft.Switch(value=theme_state["dark"], on_change=theme_toggled, active_color=theme["sky"]),
+            ], spacing=15),
+            bgcolor=theme["card"], border_radius=10, border=ft.border.all(1, theme["border"]), padding=20,
+        )
+
+        # Visual pipeline showing how data flows through the app
+        pipeline_steps = [
+            (ft.icons.STORAGE, "Historical Data", "51 years of temperature records across 226 countries form the foundation."),
+            (ft.icons.SHOW_CHART, "Machine Learning", "Linear Regression projects the trend to 2050; a neural network flags heatwave risk."),
+            (ft.icons.CLOUD, "Live Weather API", "Open-Meteo supplies real-time conditions and a 7-day forecast."),
+            (ft.icons.WARNING_AMBER, "Risk Assessment", "Rule-based logic estimates flood, storm, and heat risk from current weather."),
+            (ft.icons.DASHBOARD, "Your Dashboard", "Everything is combined into one clear, searchable view."),
+        ]
+
+        pipeline_row_items = []
+        for i, (icon, title, desc) in enumerate(pipeline_steps):
+            pipeline_row_items.append(
+                ft.Container(
+                    content=ft.Column([
+                        ft.Container(content=ft.Icon(icon, color=theme["sky"], size=26), bgcolor=theme["sky_light"],
+                                     border_radius=30, width=52, height=52, alignment=ft.alignment.center),
+                        ft.Container(height=10),
+                        ft.Text(title, size=13, weight=ft.FontWeight.BOLD, color=theme["text"], text_align=ft.TextAlign.CENTER),
+                        ft.Text(desc, size=10, color=theme["subtext"], text_align=ft.TextAlign.CENTER),
+                    ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=2),
+                    width=180, padding=10,
+                )
+            )
+            if i < len(pipeline_steps) - 1:
+                pipeline_row_items.append(ft.Icon(ft.icons.CHEVRON_RIGHT, color=theme["subtext"], size=20))
+
+        how_it_works_card = ft.Container(
+            content=ft.Column([
+                ft.Text("How Terra Forecast Works", size=17, weight=ft.FontWeight.W_600, color=theme["text"]),
+                ft.Container(height=6),
+                ft.Text(
+                    "Terra Forecast combines five decades of historical climate records with live weather data to give a "
+                    "complete picture of a country's climate situation — both where it's headed long-term, and what's "
+                    "happening right now.",
+                    size=13, color=theme["subtext"],
+                ),
+                ft.Container(height=10),
+                ft.Text(
+                    "The Dashboard gives a quick snapshot for whichever country you're exploring. Climate Prediction shows "
+                    "the temperature trend to 2050 alongside the country's typical summer and winter timing. Disaster Risk "
+                    "combines a long-term heatwave classification with live flood, storm, and heat percentages calculated "
+                    "from current conditions.",
+                    size=13, color=theme["subtext"],
+                ),
+                ft.Container(height=18),
+                ft.Row(pipeline_row_items, wrap=True, alignment=ft.MainAxisAlignment.CENTER),
+            ]),
+            bgcolor=theme["card"], border_radius=10, border=ft.border.all(1, theme["border"]), padding=22,
+        )
+
+        awareness_card = ft.Container(
+            content=ft.Column([
+                ft.Text("Understanding What You're Seeing", size=16, weight=ft.FontWeight.W_600, color=theme["text"]),
+                ft.Container(height=10),
+                ft.Text(
+                    "Not everything in this app updates at the same pace or means the same thing. Here's the distinction "
+                    "worth knowing before you interpret any screen:",
+                    size=13, color=theme["subtext"],
+                ),
+                ft.Container(height=14),
+                ft.Row([ft.Icon(ft.icons.SHOW_CHART, color=theme["sky"], size=18),
+                        ft.Column([ft.Text("Climate Prediction & Heatwave Risk", size=13, weight=ft.FontWeight.BOLD, color=theme["text"]),
+                                   ft.Text("Based on historical trend data through 2021. These reflect long-term climate patterns, not today's temperature.", size=12, color=theme["subtext"])],
+                                  spacing=2, expand=True)], spacing=10),
+                ft.Container(height=10),
+                ft.Row([ft.Icon(ft.icons.CLOUD, color=ft.colors.ORANGE_600, size=18),
+                        ft.Column([ft.Text("Live Weather & Disaster Risk Monitor", size=13, weight=ft.FontWeight.BOLD, color=theme["text"]),
+                                   ft.Text("Pulled fresh from Open-Meteo each time you refresh. These reflect real, current conditions.", size=12, color=theme["subtext"])],
+                                  spacing=2, expand=True)], spacing=10),
+                ft.Container(height=14),
+                ft.Text(
+                    "This mix of both is intentional — it shows how a country's long-term climate trajectory relates to "
+                    "what's actually happening on the ground today.",
+                    size=12, italic=True, color=theme["subtext"],
+                ),
+            ]),
+            bgcolor=theme["card"], border_radius=10, border=ft.border.all(1, theme["border"]), padding=22,
+        )
+
+        about_card = ft.Container(
+            content=ft.Column([
+                ft.Text("About Terra Forecast", size=15, weight=ft.FontWeight.BOLD, color=theme["text"]),
+                ft.Container(height=8),
+                ft.Text("A climate analysis and warning system covering 226 countries, powered by machine learning and live weather data.", size=13, color=theme["subtext"]),
+                ft.Container(height=10),
+                ft.Text("Built with Python, Flet, scikit-learn, XGBoost, Prophet, and TensorFlow.", size=12, color=theme["subtext"]),
+            ]),
+            bgcolor=theme["card"], border_radius=10, border=ft.border.all(1, theme["border"]), padding=20,
+        )
+
         content = ft.Column([
-            screen_header("Settings", "Manage app appearance and view build information."),
+            screen_header("Settings", "Manage app appearance and learn how Terra Forecast works."),
             ft.Container(height=20),
-            ft.Container(
-                content=ft.Row([
-                    ft.Icon(ft.icons.DARK_MODE, color=theme["sky"]),
-                    ft.Column([ft.Text("Dark Mode", size=15, weight=ft.FontWeight.BOLD, color=theme["text"]),
-                               ft.Text("Switch between light and dark theme", size=12, color=theme["subtext"])], spacing=2, expand=True),
-                    ft.Switch(value=theme_state["dark"], on_change=theme_toggled, active_color=theme["sky"]),
-                ], spacing=15),
-                bgcolor=theme["card"], border_radius=10, border=ft.border.all(1, theme["border"]), padding=20,
-            ),
+            theme_card,
             ft.Container(height=20),
-            ft.Container(
-                content=ft.Column([
-                    ft.Text("About Terra Forecast", size=15, weight=ft.FontWeight.BOLD, color=theme["text"]),
-                    ft.Container(height=8),
-                    ft.Text("A climate analysis and warning system covering 226 countries, powered by machine learning and live weather data.", size=13, color=theme["subtext"]),
-                    ft.Container(height=10),
-                    ft.Text("Built with Python, Flet, scikit-learn, XGBoost, Prophet, and TensorFlow.", size=12, color=theme["subtext"]),
-                ]),
-                bgcolor=theme["card"], border_radius=10, border=ft.border.all(1, theme["border"]), padding=20,
-            ),
+            how_it_works_card,
+            ft.Container(height=20),
+            awareness_card,
+            ft.Container(height=20),
+            about_card,
         ], scroll=ft.ScrollMode.AUTO)
 
         return ft.Container(content=content, padding=28, expand=True, bgcolor=theme["bg"])
 
-    # ---------- Layout shell ----------
+ # Layout shell
 
     content_area = ft.Container(content=None, expand=True, padding=0)
     sidebar_container = ft.Container(width=220, padding=10)
